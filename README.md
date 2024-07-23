@@ -1,3 +1,5 @@
+This presents reproducibility and some code modifications on the paper below as the main goal in the seminar Advanced Machine Learning for Anomaly Detection.
+
 # Catching Both Gray and Black Swans: Open-set Supervised Anomaly Detection (CVPR2022)
 By Choubo Ding, Guansong Pang, Chunhua Shen
 
