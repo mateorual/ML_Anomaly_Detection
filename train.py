@@ -9,6 +9,7 @@ from dataloaders.dataloader import initDataloader
 from modeling.net import DRA
 from tqdm import tqdm
 from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import roc_curve, precision_recall_curve # Added for plotting curves
 from modeling.layers import build_criterion
 import random
 
@@ -23,7 +24,7 @@ class Trainer(object):
         self.args = args
         # Define Dataloader
         kwargs = {'num_workers': args.workers}
-        self.train_loader, self.test_loader= initDataloader.build(args, **kwargs)
+        self.train_loader, self.test_loader = initDataloader.build(args, **kwargs)
         if self.args.total_heads == 4:
             temp_args = args
             temp_args.batch_size = self.args.nRef
@@ -33,7 +34,7 @@ class Trainer(object):
 
         self.model = DRA(args, backbone=self.args.backbone)
 
-        if self.args.pretrain_dir != None:
+        if self.args.pretrain_dir is not None:
             self.model.load_state_dict(torch.load(self.args.pretrain_dir))
             print('Load pretrain weight from: ' + self.args.pretrain_dir)
 
@@ -42,10 +43,17 @@ class Trainer(object):
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.0002, weight_decay=1e-5)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.1)
 
+        self.train_losses = []
+        self.test_losses = []
+
+        if args.know_class is not None:
+            print(f"Training with hard setting, known class: {args.know_class}")
+            # Additional logic for known class can be implemented here
+
     def generate_target(self, target, eval=False):
         targets = list()
         if eval:
-            targets.append(target==0)
+            targets.append(target == 0)
             targets.append(target)
             targets.append(target)
             targets.append(target)
@@ -64,7 +72,6 @@ class Trainer(object):
         for j in range(self.args.total_heads):
             class_loss.append(0.0)
         self.model.train()
-        self.scheduler.step()
         tbar = tqdm(self.train_loader)
         for idx, sample in enumerate(tbar):
             image, target = sample['image'], sample['label']
@@ -95,14 +102,17 @@ class Trainer(object):
 
             self.optimizer.zero_grad()
             loss.backward()
-
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
+            self.scheduler.step()  # Move scheduler step to after optimizer step
+
             train_loss += loss.item()
             for i in range(self.args.total_heads):
                 class_loss[i] += losses[i].item()
 
             tbar.set_description('Epoch:%d, Train loss: %.3f' % (epoch, train_loss / (idx + 1)))
+
+        self.train_losses.append(train_loss / len(tbar))
 
 
     def normalization(self, data):
@@ -166,6 +176,8 @@ class Trainer(object):
                 w.write(str(label) + '   ' + str(score) + "\n")
 
         total_roc, total_pr = aucPerformance(total_pred, total_target)
+        with open(self.args.experiment_dir + '/result.txt', mode='a+', encoding="utf-8") as w:
+            w.write(f"AUC-ROC: {total_roc:.4f}, AUC-PR: {total_pr:.4f}\n")
 
         normal_mask = total_target == 0
         outlier_mask = total_target == 1
@@ -173,20 +185,44 @@ class Trainer(object):
         plt.bar(np.arange(total_pred.size)[normal_mask], total_pred[normal_mask], color='green')
         plt.bar(np.arange(total_pred.size)[outlier_mask], total_pred[outlier_mask], color='red')
         plt.ylabel("Anomaly score")
-        plt.savefig(args.experiment_dir + "/vis.png")
+        plt.savefig(self.args.experiment_dir + "/vis.png")
+
+        self.test_losses.append(test_loss / len(tbar))
+
+        # Plot ROC and PR curves
+        self.plot_roc_pr_curves(total_target, total_pred)
+
         return total_roc, total_pr
 
+    def plot_roc_pr_curves(self, labels, scores):
+        fpr, tpr, _ = roc_curve(labels, scores)
+        precision, recall, _ = precision_recall_curve(labels, scores)
+
+        plt.figure()
+        plt.plot(fpr, tpr, label='ROC curve (area = %0.2f)' % roc_auc_score(labels, scores))
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Receiver Operating Characteristic')
+        plt.legend(loc="lower right")
+        plt.savefig(os.path.join(self.args.experiment_dir, 'roc_curve.png'))
+
+        plt.figure()
+        plt.plot(recall, precision, label='PR curve (area = %0.2f)' % average_precision_score(labels, scores))
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curve')
+        plt.legend(loc="lower left")
+        plt.savefig(os.path.join(self.args.experiment_dir, 'pr_curve.png'))
+
     def save_weights(self, filename):
-        # if not os.path.exists(WEIGHT_DIR):
-        #     os.makedirs(WEIGHT_DIR)
-        torch.save(self.model.state_dict(), os.path.join(args.experiment_dir, filename))
+        torch.save(self.model.state_dict(), os.path.join(self.args.experiment_dir, filename))
 
     def load_weights(self, filename):
         path = os.path.join(WEIGHT_DIR, filename)
         self.model.load_state_dict(torch.load(path))
 
     def init_network_weights_from_pretraining(self):
-
         net_dict = self.model.state_dict()
         ae_net_dict = self.ae_model.state_dict()
 
@@ -194,19 +230,22 @@ class Trainer(object):
         net_dict.update(ae_net_dict)
         self.model.load_state_dict(net_dict)
 
+
 def aucPerformance(mse, labels, prt=True):
     roc_auc = roc_auc_score(labels, mse)
     ap = average_precision_score(labels, mse)
     if prt:
         print("AUC-ROC: %.4f, AUC-PR: %.4f" % (roc_auc, ap))
-    return roc_auc, ap;
+    return roc_auc, ap
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=48, help="batch size used in SGD")
     parser.add_argument("--steps_per_epoch", type=int, default=20, help="the number of batches per epoch")
     parser.add_argument("--epochs", type=int, default=30, help="the number of epochs")
-    parser.add_argument("--cont_rate", type=float, default=0.0, help="the outlier contamination rate in the training data")
+    parser.add_argument("--cont_rate", type=float, default=0.0,
+                        help="the outlier contamination rate in the training data")
     parser.add_argument("--test_threshold", type=int, default=0,
                         help="the outlier contamination rate in the training data")
     parser.add_argument("--test_rate", type=float, default=0.0,
@@ -235,7 +274,6 @@ if __name__ == '__main__':
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     trainer = Trainer(args)
 
-
     argsDict = args.__dict__
     if not os.path.exists(args.experiment_dir):
         os.makedirs(args.experiment_dir)
@@ -252,4 +290,12 @@ if __name__ == '__main__':
         trainer.training(epoch)
     trainer.eval()
     trainer.save_weights(args.savename)
+
+    # Plot loss curves
+    plt.figure()
+    plt.plot(trainer.train_losses, label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig(os.path.join(args.experiment_dir, 'loss_curve.png'))
 
